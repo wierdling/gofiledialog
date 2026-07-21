@@ -2,6 +2,7 @@ package gofiledialog
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -40,5 +41,67 @@ func TestSavePathAddsDefaultExtension(t *testing.T) {
 func TestSavePathRejectsBlankName(t *testing.T) {
 	if _, err := savePath(".", "   ", Filter{}); err == nil {
 		t.Fatal("expected blank filename to fail")
+	}
+}
+
+func TestValidateFilterLabelsRejectsDuplicateNames(t *testing.T) {
+	err := validateFilterLabels([]Filter{
+		{Name: "Images", Extensions: []string{".png"}},
+		{Name: "Images", Extensions: []string{".jpg"}},
+	})
+	if err == nil {
+		t.Fatal("expected duplicate named filters to fail")
+	}
+	if !strings.Contains(err.Error(), `"Images"`) {
+		t.Fatalf("error = %q, want duplicate label", err)
+	}
+}
+
+func TestValidateFilterLabelsRejectsDuplicateGeneratedLabels(t *testing.T) {
+	err := validateFilterLabels([]Filter{
+		{Extensions: []string{"png", ".jpg"}},
+		{Extensions: []string{".png", "jpg"}},
+	})
+	if err == nil {
+		t.Fatal("expected duplicate generated labels to fail")
+	}
+	if !strings.Contains(err.Error(), `".png, .jpg"`) {
+		t.Fatalf("error = %q, want duplicate generated label", err)
+	}
+}
+
+func TestValidateFilterLabelsAllowsUniqueLabels(t *testing.T) {
+	if err := validateFilterLabels([]Filter{
+		{Name: "Images", Extensions: []string{".png"}},
+		{Name: "Documents", Extensions: []string{".pdf"}},
+		{Extensions: []string{".txt"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDialogConstructorsRejectDuplicateFilterLabels(t *testing.T) {
+	_, err := NewOpen(nil,
+		WithStartDir(t.TempDir()),
+		WithStore(noopStore{}),
+		WithFilters(
+			Filter{Name: "Images", Extensions: []string{".png"}},
+			Filter{Name: "Images", Extensions: []string{".jpg"}},
+		),
+	)
+	if err == nil {
+		t.Fatal("expected NewOpen to reject duplicate filter labels")
+	}
+
+	_, err = NewSave(nil,
+		WithStartDir(t.TempDir()),
+		WithStore(noopStore{}),
+		WithFilters(
+			Filter{Extensions: []string{".txt"}},
+			Filter{Extensions: []string{"txt"}},
+		),
+	)
+	if err == nil {
+		t.Fatal("expected NewSave to reject duplicate filter labels")
 	}
 }

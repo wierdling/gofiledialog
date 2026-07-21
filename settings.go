@@ -15,11 +15,13 @@ type ColumnSetting struct {
 	Width   float32  `json:"width"`
 }
 
-// Settings is the dialog state that persists across processes: view mode,
-// sort, visible columns and their widths, the hidden-files toggle, and
-// window size. It is shared by every app that imports gofiledialog and uses
-// the default Store (see WithStore to opt out).
+// Settings is the dialog state that persists across processes: the last
+// folder, view mode, sort, visible columns and their widths, the hidden-files
+// toggle, and window size. It is shared by every app that imports
+// gofiledialog and uses the default Store (see WithStore to opt out).
 type Settings struct {
+	// LastDir is used when Fyne has no remembered file-dialog location.
+	LastDir       string          `json:"lastDir"`
 	ViewMode      string          `json:"viewMode"`
 	ShowHidden    bool            `json:"showHidden"`
 	SortColumn    ColumnID        `json:"sortColumn"`
@@ -102,9 +104,15 @@ func normalizeColumnSettings(settings []ColumnSetting) []ColumnSetting {
 	return out
 }
 
-// Store loads and saves Settings. The default, used unless an app supplies
+// Store loads and saves Settings. Dialog persistence is best-effort: Load
+// errors fall back to defaults, and Save errors are intentionally ignored so
+// a settings backend cannot break user interaction.
+//
+// The default, used unless an app supplies
 // its own via WithStore, is a JSON file shared across every app on the
-// machine that uses gofiledialog with its default settings.
+// machine that uses gofiledialog with its default settings. The default store
+// serializes in-process saves, coordinates writes with other processes through
+// a lock file, and replaces the settings file atomically.
 type Store interface {
 	Load() (Settings, error)
 	Save(Settings) error
@@ -123,6 +131,12 @@ func defaultSettingsPath() (string, error) {
 type fileStore struct {
 	path string
 }
+
+var settingsPathLocks sync.Map
+
+const (
+	settingsLockTimeout = 2 * time.Second
+)
 
 // newFileStore resolves the default Store. If the OS config directory can't
 // be determined, it falls back to a no-op store (settings simply won't
@@ -154,10 +168,21 @@ func (s fileStore) Save(settings Settings) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
+	dir := filepath.Dir(s.path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(s.path, data, 0o644)
+
+	unlockPath := lockSettingsPath(s.path)
+	defer unlockPath()
+
+	unlockFile, err := acquireSettingsFileLock(s.path)
+	if err != nil {
+		return err
+	}
+	defer unlockFile()
+
+	return writeFileAtomic(s.path, data, 0o644)
 }
 
 type noopStore struct{}
@@ -167,13 +192,16 @@ func (noopStore) Save(Settings) error     { return nil }
 
 // debouncedSaver coalesces rapid successive setting changes (e.g. repeated
 // column toggles) into a single write, plus a Flush for saving immediately
-// on dialog close.
+// on dialog close. Store.Save errors are deliberately ignored because dialog
+// settings are best-effort UI state.
 type debouncedSaver struct {
 	store Store
 	delay time.Duration
 
-	mu    sync.Mutex
-	timer *time.Timer
+	mu      sync.Mutex
+	saveMu  sync.Mutex
+	timer   *time.Timer
+	version uint64
 }
 
 func newDebouncedSaver(store Store, delay time.Duration) *debouncedSaver {
@@ -183,18 +211,97 @@ func newDebouncedSaver(store Store, delay time.Duration) *debouncedSaver {
 func (d *debouncedSaver) Save(s Settings) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.version++
+	version := d.version
 	if d.timer != nil {
 		d.timer.Stop()
 	}
-	d.timer = time.AfterFunc(d.delay, func() { d.store.Save(s) })
+	d.timer = time.AfterFunc(d.delay, func() { d.saveIfCurrent(version, s) })
 }
 
 func (d *debouncedSaver) Flush(s Settings) {
 	d.mu.Lock()
+	d.version++
 	if d.timer != nil {
 		d.timer.Stop()
 		d.timer = nil
 	}
 	d.mu.Unlock()
-	d.store.Save(s)
+	d.save(s)
+}
+
+func (d *debouncedSaver) saveIfCurrent(version uint64, s Settings) {
+	d.mu.Lock()
+	current := version == d.version
+	d.mu.Unlock()
+	if !current {
+		return
+	}
+	d.save(s)
+}
+
+func (d *debouncedSaver) save(s Settings) {
+	d.saveMu.Lock()
+	defer d.saveMu.Unlock()
+	_ = d.store.Save(s)
+}
+
+func lockSettingsPath(path string) func() {
+	canonical := filepath.Clean(path)
+	value, _ := settingsPathLocks.LoadOrStore(canonical, &sync.Mutex{})
+	mu := value.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+func acquireSettingsFileLock(path string) (func(), error) {
+	lockPath := path + ".lock"
+	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if err := lockFile(file, settingsLockTimeout); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return func() {
+		_ = unlockFile(file)
+		_ = file.Close()
+	}, nil
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := replaceFile(tmpPath, path); err != nil {
+		return err
+	}
+	cleanup = false
+	return syncDir(dir)
 }

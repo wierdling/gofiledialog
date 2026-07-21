@@ -2,19 +2,27 @@ package gofiledialog
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/widget"
 )
 
 const settingsSaveDelay = 500 * time.Millisecond
+
+// fyneLastFolderKey is the key used by Fyne's built-in file dialogs. Reading
+// it lets applications switch between Fyne's dialog and this one without
+// losing their most recently used folder.
+const fyneLastFolderKey = "fyne:fileDialogLastFolder"
 
 // Option configures a dialog created by NewOpen (and, in later phases,
 // NewSave / NewFolder).
@@ -39,9 +47,10 @@ func WithStartDir(dir string) Option {
 	return func(o *options) { o.startDir = dir }
 }
 
-// WithStore overrides where view/sort/column/window settings are persisted.
-// By default they're shared, via a JSON file in the OS config directory,
-// across every app on the machine using gofiledialog's default settings.
+// WithStore overrides where the last folder and view/sort/column/window
+// settings are persisted. By default they're shared, via a JSON file in the
+// OS config directory, across every app on the machine using gofiledialog's
+// default settings.
 func WithStore(store Store) Option {
 	return func(o *options) { o.store = store }
 }
@@ -71,37 +80,100 @@ func defaultStartDir() string {
 	return "."
 }
 
+// startDir selects the initial directory. An explicit option always wins;
+// otherwise prefer Fyne's remembered file-dialog directory, then this
+// package's persisted directory, and finally the user's home directory.
+func startDir(explicit string, settings Settings) string {
+	if explicit != "" {
+		return explicit
+	}
+	if app := fyne.CurrentApp(); app != nil {
+		if uri, err := storage.ParseURI(app.Preferences().String(fyneLastFolderKey)); err == nil && uri != nil && uri.Scheme() == "file" {
+			if path := filepath.FromSlash(uri.Path()); isDirectory(path) {
+				return path
+			}
+		}
+	}
+	if isDirectory(settings.LastDir) {
+		return settings.LastDir
+	}
+	return defaultStartDir()
+}
+
+func isDirectory(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
 // OpenDialog is a file-open dialog window.
 type OpenDialog struct {
-	win      fyne.Window
-	browser  *Browser
-	onChosen func(paths []string, err error)
+	win        fyne.Window
+	browser    *Browser
+	fileEntry  *widget.Entry
+	filter     Filter
+	onChosen   func(paths []string, err error)
+	completion dialogCompletion
 }
 
 // SaveDialog is a file-save dialog window.
 type SaveDialog struct {
-	win       fyne.Window
-	browser   *Browser
-	fileEntry *widget.Entry
-	filter    Filter
-	onChosen  func(paths []string, err error)
+	win        fyne.Window
+	browser    *Browser
+	fileEntry  *widget.Entry
+	filter     Filter
+	onChosen   func(paths []string, err error)
+	completion dialogCompletion
 }
 
 // FolderDialog is a folder-selection dialog window.
 type FolderDialog struct {
-	win      fyne.Window
-	browser  *Browser
-	onChosen func(paths []string, err error)
+	win        fyne.Window
+	browser    *Browser
+	onChosen   func(paths []string, err error)
+	completion dialogCompletion
 }
 
-// NewOpen builds an Open-file dialog. parent, if non-nil, is used to center
-// the dialog window. The dialog is not shown until Show is called.
+type dialogCompletion struct {
+	once sync.Once
+}
+
+func (c *dialogCompletion) finish(win fyne.Window, closeWindow bool, onChosen func([]string, error), paths []string, err error) {
+	var completed bool
+	var callbackPaths []string
+	var callbackErr error
+	var callback func([]string, error)
+	c.once.Do(func() {
+		completed = true
+		callback = onChosen
+		callbackErr = err
+		if paths != nil {
+			callbackPaths = append([]string(nil), paths...)
+		}
+	})
+	if !completed {
+		return
+	}
+	if closeWindow && win != nil {
+		win.Close()
+	}
+	if callback != nil {
+		callback(callbackPaths, callbackErr)
+	}
+}
+
+// NewOpen builds an Open-file dialog. The dialog is not shown until Show is
+// called. parent is accepted for API compatibility with Fyne's dialog helpers;
+// gofiledialog currently creates a top-level window and centers it on screen
+// because fyne.Window does not expose portable parent-relative placement.
 func NewOpen(parent fyne.Window, opts ...Option) (*OpenDialog, error) {
-	o := options{title: "Open", startDir: defaultStartDir()}
+	o := options{title: "Open"}
 	for _, opt := range opts {
 		opt(&o)
 	}
 	o.filters = normalizeFilters(o.filters)
+	if err := validateFilterLabels(o.filters); err != nil {
+		return nil, err
+	}
 	if o.store == nil {
 		o.store = newFileStore()
 	}
@@ -109,6 +181,7 @@ func NewOpen(parent fyne.Window, opts ...Option) (*OpenDialog, error) {
 	if settings.WindowWidth <= 0 || settings.WindowHeight <= 0 {
 		settings.WindowWidth, settings.WindowHeight = 720, 480
 	}
+	o.startDir = startDir(o.startDir, settings)
 
 	browser, err := NewBrowser(o.startDir)
 	if err != nil {
@@ -121,8 +194,9 @@ func NewOpen(parent fyne.Window, opts ...Option) (*OpenDialog, error) {
 		return nil, err
 	}
 
-	d := &OpenDialog{browser: browser}
+	d := &OpenDialog{browser: browser, filter: activeFilter}
 	win := fyne.CurrentApp().NewWindow(o.title)
+	d.win = win
 
 	showErr := func(err error) { dialog.ShowError(err, win) }
 	browser.OnError = showErr
@@ -130,7 +204,11 @@ func NewOpen(parent fyne.Window, opts ...Option) (*OpenDialog, error) {
 	saver := newDebouncedSaver(o.store, settingsSaveDelay)
 	buildSettings := func() Settings { return snapshotSettings(browser, win) }
 	browser.OnSettingsChanged = func() { saver.Save(buildSettings()) }
-	win.SetOnClosed(func() { saver.Flush(buildSettings()) })
+	win.SetOnClosed(func() {
+		saver.Flush(buildSettings())
+		browser.Close()
+		d.finishFromWindowClose()
+	})
 
 	newFolderBtn := widget.NewButton("New Folder", func() { showNewFolderDialog(win, browser, showErr) })
 	toolbar := container.NewVBox(newToolbar(browser, showErr), container.NewHBox(newFolderBtn))
@@ -151,8 +229,10 @@ func NewOpen(parent fyne.Window, opts ...Option) (*OpenDialog, error) {
 
 	fileNameEntry := widget.NewEntry()
 	fileNameEntry.SetPlaceHolder("File name")
+	d.fileEntry = fileNameEntry
 	filterSelect := newFilterSelect(o.filters, activeFilter, func(filter Filter) {
 		activeFilter = filter
+		d.filter = filter
 		if err := browser.SetFilter(filter.Match); err != nil {
 			showErr(err)
 		}
@@ -183,22 +263,28 @@ func NewOpen(parent fyne.Window, opts ...Option) (*OpenDialog, error) {
 	win.SetContent(main)
 	win.Resize(fyne.NewSize(settings.WindowWidth, settings.WindowHeight))
 
-	d.win = win
 	return d, nil
 }
 
 // NewSave builds a Save-file dialog. The chosen path is returned without
-// creating the file; callers decide how to write it.
+// creating the file; callers decide how to write it. parent is accepted for API
+// compatibility with Fyne's dialog helpers; gofiledialog currently creates a
+// top-level window and centers it on screen because fyne.Window does not expose
+// portable parent-relative placement.
 func NewSave(parent fyne.Window, opts ...Option) (*SaveDialog, error) {
-	o := options{title: "Save As", startDir: defaultStartDir()}
+	o := options{title: "Save As"}
 	for _, opt := range opts {
 		opt(&o)
 	}
 	o.filters = normalizeFilters(o.filters)
+	if err := validateFilterLabels(o.filters); err != nil {
+		return nil, err
+	}
 	if o.store == nil {
 		o.store = newFileStore()
 	}
 	settings, _ := o.store.Load()
+	o.startDir = startDir(o.startDir, settings)
 
 	browser, err := NewBrowser(o.startDir)
 	if err != nil {
@@ -212,13 +298,18 @@ func NewSave(parent fyne.Window, opts ...Option) (*SaveDialog, error) {
 
 	d := &SaveDialog{browser: browser, filter: activeFilter}
 	win := fyne.CurrentApp().NewWindow(o.title)
+	d.win = win
 	showErr := func(err error) { dialog.ShowError(err, win) }
 	browser.OnError = showErr
 
 	saver := newDebouncedSaver(o.store, settingsSaveDelay)
 	buildSettings := func() Settings { return snapshotSettings(browser, win) }
 	browser.OnSettingsChanged = func() { saver.Save(buildSettings()) }
-	win.SetOnClosed(func() { saver.Flush(buildSettings()) })
+	win.SetOnClosed(func() {
+		saver.Flush(buildSettings())
+		browser.Close()
+		d.finishFromWindowClose()
+	})
 
 	newFolderBtn := widget.NewButton("New Folder", func() { showNewFolderDialog(win, browser, showErr) })
 	toolbar := container.NewVBox(newToolbar(browser, showErr), container.NewHBox(newFolderBtn))
@@ -273,14 +364,16 @@ func NewSave(parent fyne.Window, opts ...Option) (*SaveDialog, error) {
 	main := container.NewBorder(topBar, container.NewVBox(fields, buttons), sidebar, nil, browser.Content())
 	win.SetContent(main)
 	win.Resize(fyne.NewSize(settings.WindowWidth, settings.WindowHeight))
-	d.win = win
 	return d, nil
 }
 
 // NewFolder builds a folder-selection dialog. The currently displayed folder
-// is returned when the user chooses Select Folder.
+// is returned when the user chooses Select Folder. parent is accepted for API
+// compatibility with Fyne's dialog helpers; gofiledialog currently creates a
+// top-level window and centers it on screen because fyne.Window does not expose
+// portable parent-relative placement.
 func NewFolder(parent fyne.Window, opts ...Option) (*FolderDialog, error) {
-	o := options{title: "Select Folder", startDir: defaultStartDir()}
+	o := options{title: "Select Folder"}
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -288,6 +381,7 @@ func NewFolder(parent fyne.Window, opts ...Option) (*FolderDialog, error) {
 		o.store = newFileStore()
 	}
 	settings, _ := o.store.Load()
+	o.startDir = startDir(o.startDir, settings)
 
 	browser, err := NewBrowser(o.startDir)
 	if err != nil {
@@ -297,13 +391,18 @@ func NewFolder(parent fyne.Window, opts ...Option) (*FolderDialog, error) {
 
 	d := &FolderDialog{browser: browser}
 	win := fyne.CurrentApp().NewWindow(o.title)
+	d.win = win
 	showErr := func(err error) { dialog.ShowError(err, win) }
 	browser.OnError = showErr
 
 	saver := newDebouncedSaver(o.store, settingsSaveDelay)
 	buildSettings := func() Settings { return snapshotSettings(browser, win) }
 	browser.OnSettingsChanged = func() { saver.Save(buildSettings()) }
-	win.SetOnClosed(func() { saver.Flush(buildSettings()) })
+	win.SetOnClosed(func() {
+		saver.Flush(buildSettings())
+		browser.Close()
+		d.finishFromWindowClose()
+	})
 
 	newFolderBtn := widget.NewButton("New Folder", func() { showNewFolderDialog(win, browser, showErr) })
 	toolbar := container.NewVBox(newToolbar(browser, showErr), container.NewHBox(newFolderBtn))
@@ -329,7 +428,6 @@ func NewFolder(parent fyne.Window, opts ...Option) (*FolderDialog, error) {
 	main := container.NewBorder(topBar, buttons, sidebar, nil, browser.Content())
 	win.SetContent(main)
 	win.Resize(fyne.NewSize(settings.WindowWidth, settings.WindowHeight))
-	d.win = win
 	return d, nil
 }
 
@@ -343,6 +441,7 @@ func snapshotSettings(browser *Browser, win fyne.Window) Settings {
 	}
 	size := win.Canvas().Size()
 	return Settings{
+		LastDir:       browser.CurrentDir(),
 		ViewMode:      string(browser.ViewMode()),
 		ShowHidden:    browser.ShowHidden(),
 		SortColumn:    browser.SortColumn(),
@@ -354,6 +453,15 @@ func snapshotSettings(browser *Browser, win fyne.Window) Settings {
 }
 
 func (d *OpenDialog) chooseSelected() {
+	if names := strings.TrimSpace(d.fileEntry.Text); names != "" {
+		paths, err := d.typedPaths(names)
+		if err != nil {
+			dialog.ShowError(err, d.win)
+			return
+		}
+		d.finish(paths, nil)
+		return
+	}
 	selected := d.browser.SelectedEntries()
 	if len(selected) == 0 {
 		return
@@ -365,15 +473,49 @@ func (d *OpenDialog) chooseSelected() {
 	d.finish(paths, nil)
 }
 
+// typedPaths resolves semicolon-separated names from the displayed directory.
+// It accepts only regular files that match the active filter.
+func (d *OpenDialog) typedPaths(names string) ([]string, error) {
+	parts := strings.Split(names, ";")
+	if len(parts) > 1 && !d.browser.MultiSelect() {
+		return nil, fmt.Errorf("multiple files are not allowed")
+	}
+	paths := make([]string, 0, len(parts))
+	for _, name := range parts {
+		name = strings.TrimSpace(name)
+		if name == "" || filepath.Base(name) != name || name == "." {
+			return nil, fmt.Errorf("invalid file name %q", name)
+		}
+		path := filepath.Join(d.browser.CurrentDir(), name)
+		info, err := os.Stat(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil, fmt.Errorf("file %q does not exist", name)
+			}
+			return nil, err
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("%q is not a regular file", name)
+		}
+		entry := FileEntry{Name: name, Path: path}
+		if !d.filter.Match(entry) {
+			return nil, fmt.Errorf("file %q does not match the selected type", name)
+		}
+		paths = append(paths, path)
+	}
+	return paths, nil
+}
+
 func (d *OpenDialog) cancel() {
 	d.finish(nil, nil)
 }
 
 func (d *OpenDialog) finish(paths []string, err error) {
-	d.win.Close()
-	if d.onChosen != nil {
-		d.onChosen(paths, err)
-	}
+	d.completion.finish(d.win, true, d.onChosen, paths, err)
+}
+
+func (d *OpenDialog) finishFromWindowClose() {
+	d.completion.finish(d.win, false, d.onChosen, nil, nil)
 }
 
 // SetOnChosen sets the callback invoked when the dialog closes. paths is nil
@@ -382,7 +524,7 @@ func (d *OpenDialog) SetOnChosen(f func(paths []string, err error)) {
 	d.onChosen = f
 }
 
-// Show displays the dialog window.
+// Show displays the dialog window, centered on screen.
 func (d *OpenDialog) Show() {
 	d.win.CenterOnScreen()
 	d.win.Show()
@@ -394,7 +536,11 @@ func (d *SaveDialog) chooseSave() {
 		dialog.ShowError(err, d.win)
 		return
 	}
-	if _, err := os.Stat(path); err == nil {
+	if info, err := os.Stat(path); err == nil {
+		if info.IsDir() {
+			dialog.ShowError(fmt.Errorf("%q is a directory", filepath.Base(path)), d.win)
+			return
+		}
 		dialog.ShowConfirm("Overwrite?", "Are you sure you want to overwrite "+filepath.Base(path)+"?", func(ok bool) {
 			if ok {
 				d.finish([]string{path}, nil)
@@ -413,10 +559,11 @@ func (d *SaveDialog) cancel() {
 }
 
 func (d *SaveDialog) finish(paths []string, err error) {
-	d.win.Close()
-	if d.onChosen != nil {
-		d.onChosen(paths, err)
-	}
+	d.completion.finish(d.win, true, d.onChosen, paths, err)
+}
+
+func (d *SaveDialog) finishFromWindowClose() {
+	d.completion.finish(d.win, false, d.onChosen, nil, nil)
 }
 
 // SetOnChosen sets the callback invoked when the Save dialog closes.
@@ -424,7 +571,7 @@ func (d *SaveDialog) SetOnChosen(f func(paths []string, err error)) {
 	d.onChosen = f
 }
 
-// Show displays the Save dialog window.
+// Show displays the Save dialog window, centered on screen.
 func (d *SaveDialog) Show() {
 	d.win.CenterOnScreen()
 	d.win.Show()
@@ -435,10 +582,11 @@ func (d *FolderDialog) cancel() {
 }
 
 func (d *FolderDialog) finish(paths []string, err error) {
-	d.win.Close()
-	if d.onChosen != nil {
-		d.onChosen(paths, err)
-	}
+	d.completion.finish(d.win, true, d.onChosen, paths, err)
+}
+
+func (d *FolderDialog) finishFromWindowClose() {
+	d.completion.finish(d.win, false, d.onChosen, nil, nil)
 }
 
 // SetOnChosen sets the callback invoked when the Folder dialog closes.
@@ -446,14 +594,15 @@ func (d *FolderDialog) SetOnChosen(f func(paths []string, err error)) {
 	d.onChosen = f
 }
 
-// Show displays the Folder dialog window.
+// Show displays the Folder dialog window, centered on screen.
 func (d *FolderDialog) Show() {
 	d.win.CenterOnScreen()
 	d.win.Show()
 }
 
 // ShowOpen is a convenience wrapper that builds and immediately shows an
-// Open dialog, in the style of fyne.io/fyne/v2/dialog.ShowFileOpen.
+// Open dialog, in the style of fyne.io/fyne/v2/dialog.ShowFileOpen. parent is
+// accepted for API compatibility but is not used for placement.
 func ShowOpen(onChosen func(paths []string, err error), parent fyne.Window, opts ...Option) error {
 	d, err := NewOpen(parent, opts...)
 	if err != nil {
@@ -465,7 +614,8 @@ func ShowOpen(onChosen func(paths []string, err error), parent fyne.Window, opts
 }
 
 // ShowSave is a convenience wrapper that builds and immediately shows a Save
-// dialog.
+// dialog. parent is accepted for API compatibility but is not used for
+// placement.
 func ShowSave(onChosen func(paths []string, err error), parent fyne.Window, opts ...Option) error {
 	d, err := NewSave(parent, opts...)
 	if err != nil {
@@ -477,7 +627,8 @@ func ShowSave(onChosen func(paths []string, err error), parent fyne.Window, opts
 }
 
 // ShowFolder is a convenience wrapper that builds and immediately shows a
-// folder-selection dialog.
+// folder-selection dialog. parent is accepted for API compatibility but is not
+// used for placement.
 func ShowFolder(onChosen func(paths []string, err error), parent fyne.Window, opts ...Option) error {
 	d, err := NewFolder(parent, opts...)
 	if err != nil {
@@ -533,14 +684,13 @@ func showNewFolderDialog(win fyne.Window, b *Browser, onError func(error)) {
 		if !ok {
 			return
 		}
-		name := strings.TrimSpace(nameEntry.Text)
-		if name == "" {
+		path, err := newFolderPath(b.CurrentDir(), nameEntry.Text)
+		if err != nil {
 			if onError != nil {
-				onError(errors.New("enter a folder name"))
+				onError(err)
 			}
 			return
 		}
-		path := filepath.Join(b.CurrentDir(), filepath.Clean(name))
 		if err := os.Mkdir(path, 0o755); err != nil {
 			if onError != nil {
 				onError(err)
@@ -551,6 +701,49 @@ func showNewFolderDialog(win fyne.Window, b *Browser, onError func(error)) {
 			onError(err)
 		}
 	}, win)
+}
+
+func newFolderPath(dir, name string) (string, error) {
+	if strings.TrimSpace(name) != name {
+		if strings.TrimSpace(name) == "" {
+			return "", errors.New("enter a folder name")
+		}
+		return "", errors.New("folder name must not start or end with whitespace")
+	}
+	if err := validateFolderName(name); err != nil {
+		return "", err
+	}
+
+	baseDir := filepath.Clean(dir)
+	path := filepath.Join(baseDir, name)
+	cleaned := filepath.Clean(path)
+	rel, err := filepath.Rel(baseDir, cleaned)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+		return "", errors.New("folder name must stay inside the current folder")
+	}
+	return cleaned, nil
+}
+
+func validateFolderName(name string) error {
+	if name == "" {
+		return errors.New("enter a folder name")
+	}
+	if name == "." || name == ".." {
+		return errors.New("folder name must not be . or ..")
+	}
+	if filepath.IsAbs(name) {
+		return errors.New("folder name must not be an absolute path")
+	}
+	if strings.ContainsAny(name, `/\`) {
+		return errors.New("folder name must not contain path separators")
+	}
+	if strings.IndexFunc(name, func(r rune) bool { return r == 0 || r < 32 }) >= 0 {
+		return errors.New("folder name contains an invalid character")
+	}
+	if err := validatePlatformFolderName(name); err != nil {
+		return err
+	}
+	return nil
 }
 
 func installKeyboardShortcuts(win fyne.Window, b *Browser, onEnter, onCancel func()) {

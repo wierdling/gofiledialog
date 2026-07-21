@@ -8,5 +8,7 @@ import (
 )
 
 func isHidden(info os.FileInfo) bool {
-	return strings.HasPrefix(info.Name(), ".")
+	return isHiddenName(info.Name(), info)
 }
+
+func isHiddenName(name string, _ os.FileInfo) bool { return strings.HasPrefix(name, ".") }

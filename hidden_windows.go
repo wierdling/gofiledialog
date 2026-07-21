@@ -14,3 +14,6 @@ func isHidden(info os.FileInfo) bool {
 	}
 	return data.FileAttributes&syscall.FILE_ATTRIBUTE_HIDDEN != 0
 }
+
+// Windows visibility is an attribute of the target metadata, not its name.
+func isHiddenName(_ string, info os.FileInfo) bool { return isHidden(info) }

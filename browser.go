@@ -3,6 +3,7 @@ package gofiledialog
 import (
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -36,9 +37,10 @@ type Browser struct {
 	grids map[ViewMode]*widget.GridWrap
 	views []entryView
 
-	viewMode ViewMode
-	stack    *fyne.Container
-	thumbs   *thumbnailer
+	viewMode  ViewMode
+	stack     *fyne.Container
+	thumbs    *thumbnailer
+	closeOnce sync.Once
 
 	columns []Column
 	sortCol ColumnID
@@ -159,13 +161,19 @@ func (b *Browser) SetMultiSelect(enabled bool) {
 	b.clearSelection()
 }
 
+// MultiSelect reports whether the browser permits more than one selected file.
+func (b *Browser) MultiSelect() bool { return b.multi }
+
 // SortColumn and SortAscending report the current Details-view sort state.
 func (b *Browser) SortColumn() ColumnID { return b.sortCol }
 func (b *Browser) SortAscending() bool  { return b.sortAsc }
 
 // SetSort sorts the Details view by column id, toggling direction if id is
-// already the active sort column.
+// already the active sort column. Unknown column IDs are ignored.
 func (b *Browser) SetSort(id ColumnID) {
+	if !knownColumnID(id) {
+		return
+	}
 	if b.sortCol == id {
 		b.sortAsc = !b.sortAsc
 	} else {
@@ -450,6 +458,16 @@ func (b *Browser) Refresh() error {
 // Content returns the canvas object to embed in a dialog window.
 func (b *Browser) Content() fyne.CanvasObject {
 	return b.stack
+}
+
+// Close releases background resources owned by the browser. A closed browser
+// must not be reused.
+func (b *Browser) Close() {
+	b.closeOnce.Do(func() {
+		if b.thumbs != nil {
+			b.thumbs.Close()
+		}
+	})
 }
 
 // onEntryTapped handles a single-click/tap on entries[index] from whichever

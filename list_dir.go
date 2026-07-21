@@ -1,6 +1,9 @@
 package gofiledialog
 
-import "os"
+import (
+	"os"
+	"path/filepath"
+)
 
 // listDir reads dir and returns its entries as FileEntry values, in
 // directory order. Entries that can no longer be stat'd (e.g. removed
@@ -19,11 +22,24 @@ func listDir(dir string, showHidden bool, filters ...func(FileEntry) bool) ([]Fi
 
 	entries := make([]FileEntry, 0, len(dirEntries))
 	for _, de := range dirEntries {
-		info, err := de.Info()
+		name := de.Name()
+		linkInfo, err := de.Info()
 		if err != nil {
 			continue
 		}
+		info := linkInfo
+		if info.Mode()&os.ModeSymlink != 0 {
+			info, err = os.Stat(filepath.Join(dir, name))
+			if err != nil {
+				continue
+			}
+		}
 		entry := newFileEntry(dir, info)
+		entry.Name = name
+		entry.Path = filepath.Join(dir, name)
+		// de.Info follows symlinks above, but visibility belongs to the name
+		// shown in this directory, not to the target's name.
+		entry.Hidden = isHiddenName(name, linkInfo)
 		if entry.Hidden && !showHidden {
 			continue
 		}

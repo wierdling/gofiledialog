@@ -167,10 +167,18 @@ d.Show()
 - `WithFileName(name string)` pre-fills Save dialogs.
 - `WithStore(store Store)` overrides the default shared settings store.
 
+## Parent Window Parameter
+
+The `parent fyne.Window` parameter on `ShowOpen`, `ShowSave`, `ShowFolder`,
+`NewOpen`, `NewSave`, and `NewFolder` is accepted for API compatibility with
+Fyne's dialog helpers. `gofiledialog` currently creates top-level windows and
+centers them on screen because Fyne's public `fyne.Window` interface does not
+expose portable parent-relative window placement.
+
 ## Settings
 
 By default, view mode, sort column/direction, visible columns, column order,
-column widths, dialog size, and hidden-file visibility are persisted in:
+column widths, dialog size, hidden-file visibility, and the last folder are persisted in:
 
 ```text
 os.UserConfigDir()/wierdling-gofiledialog/settings.json
@@ -178,7 +186,19 @@ os.UserConfigDir()/wierdling-gofiledialog/settings.json
 
 That means settings are shared by every app on the machine that uses the
 default `gofiledialog` store. Use `WithStore` if an app needs isolated or
-custom persistence.
+custom persistence. Settings persistence is best-effort: load failures fall
+back to defaults, and save failures are ignored so a settings backend cannot
+break a user's file-dialog interaction.
+
+When no `WithStartDir` is supplied, the dialog first uses Fyne's saved
+`fyne:fileDialogLastFolder` preference (when it names an accessible local
+folder); otherwise it uses the saved `lastDir` setting.
+
+The default store writes through a temporary file and atomically replaces the
+settings file, so readers never observe partial JSON. Saves are serialized
+within the process and coordinated across processes with a short-lived
+`settings.json.lock` file. If another process holds the lock for too long, the
+save is skipped and the last valid settings file is left intact.
 
 ## Thumbnails
 

@@ -71,6 +71,9 @@ type thumbnailer struct {
 	diskDir    string
 	inflight   map[string]*thumbnailRequest
 	generation uint64
+	closed     bool
+	wg         sync.WaitGroup
+	generate   func(FileEntry, int) fyne.Resource
 }
 
 type thumbJob struct {
@@ -101,15 +104,6 @@ func (q *jobQueue) Pop() any {
 }
 
 func newThumbnailer() *thumbnailer {
-	t := &thumbnailer{
-		memory:   lru.New(thumbnailMemoryEntries),
-		inflight: make(map[string]*thumbnailRequest),
-	}
-	t.cond = sync.NewCond(&t.mu)
-	if dir, err := os.UserCacheDir(); err == nil {
-		t.diskDir = filepath.Join(dir, "wierdling-gofiledialog", "thumbcache")
-	}
-
 	workers := runtime.NumCPU()
 	if workers < 1 {
 		workers = 1
@@ -117,17 +111,40 @@ func newThumbnailer() *thumbnailer {
 	if workers > maxThumbnailWorkers {
 		workers = maxThumbnailWorkers
 	}
+	return newThumbnailerWithWorkers(workers)
+}
+
+func newThumbnailerWithWorkers(workers int) *thumbnailer {
+	if workers < 1 {
+		workers = 1
+	}
+	t := &thumbnailer{
+		memory:   lru.New(thumbnailMemoryEntries),
+		inflight: make(map[string]*thumbnailRequest),
+	}
+	t.cond = sync.NewCond(&t.mu)
+	t.generate = t.generateThumbnail
+	if dir, err := os.UserCacheDir(); err == nil {
+		t.diskDir = filepath.Join(dir, "wierdling-gofiledialog", "thumbcache")
+	}
+
 	for i := 0; i < workers; i++ {
+		t.wg.Add(1)
 		go t.worker()
 	}
 	return t
 }
 
 func (t *thumbnailer) worker() {
+	defer t.wg.Done()
 	for {
 		t.mu.Lock()
-		for t.queue.Len() == 0 {
+		for t.queue.Len() == 0 && !t.closed {
 			t.cond.Wait()
+		}
+		if t.closed {
+			t.mu.Unlock()
+			return
 		}
 		job := heap.Pop(&t.queue).(thumbJob)
 		t.mu.Unlock()
@@ -139,6 +156,10 @@ func (t *thumbnailer) worker() {
 
 func (t *thumbnailer) finish(key string, generation uint64, res fyne.Resource) {
 	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return
+	}
 	request, ok := t.inflight[key]
 	if !ok || request.generation != generation {
 		t.mu.Unlock()
@@ -160,10 +181,31 @@ func (t *thumbnailer) finish(key string, generation uint64, res fyne.Resource) {
 // when it belongs to the previous generation.
 func (t *thumbnailer) CancelPending() {
 	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return
+	}
 	t.generation++
 	t.queue = nil
 	t.inflight = make(map[string]*thumbnailRequest)
 	t.mu.Unlock()
+}
+
+func (t *thumbnailer) Close() {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		t.wg.Wait()
+		return
+	}
+	t.closed = true
+	t.generation++
+	t.queue = nil
+	t.inflight = make(map[string]*thumbnailRequest)
+	t.cond.Broadcast()
+	t.mu.Unlock()
+
+	t.wg.Wait()
 }
 
 // Request queues async thumbnail generation for entry at the given pixel
@@ -177,6 +219,12 @@ func (t *thumbnailer) Request(entry FileEntry, size int, done func(fyne.Resource
 	if done == nil {
 		return
 	}
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return
+	}
+	t.mu.Unlock()
 	if entry.IsDir || !isThumbnailable(entry.Name) || entry.Size > maxThumbnailFileBytes {
 		done(nil)
 		return
@@ -188,6 +236,10 @@ func (t *thumbnailer) Request(entry FileEntry, size int, done func(fyne.Resource
 	}
 
 	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return
+	}
 	if request, ok := t.inflight[key]; ok {
 		request.done = append(request.done, done)
 		t.mu.Unlock()
@@ -210,6 +262,12 @@ func (t *thumbnailer) Request(entry FileEntry, size int, done func(fyne.Resource
 // decide whether showing a "loading" placeholder is worthwhile. It's a
 // best-effort hint, not a guarantee — Request still applies the same rules.
 func (t *thumbnailer) MightThumbnail(entry FileEntry) bool {
+	t.mu.Lock()
+	closed := t.closed
+	t.mu.Unlock()
+	if closed {
+		return false
+	}
 	return !entry.IsDir && isThumbnailable(entry.Name) && entry.Size <= maxThumbnailFileBytes
 }
 
@@ -219,7 +277,7 @@ func thumbnailCacheKey(entry FileEntry, size int) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-func (t *thumbnailer) generate(entry FileEntry, size int) fyne.Resource {
+func (t *thumbnailer) generateThumbnail(entry FileEntry, size int) fyne.Resource {
 	key := thumbnailCacheKey(entry, size)
 	if cached, ok := t.memory.Get(key); ok {
 		return cached.(fyne.Resource)

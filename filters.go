@@ -1,6 +1,7 @@
 package gofiledialog
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 )
@@ -63,6 +64,18 @@ func normalizeExtensions(exts []string) []string {
 		out = append(out, ext)
 	}
 	return out
+}
+
+func validateFilterLabels(filters []Filter) error {
+	seen := make(map[string]struct{}, len(filters))
+	for _, filter := range filters {
+		label := filter.Label()
+		if _, ok := seen[label]; ok {
+			return fmt.Errorf("duplicate filter label %q", label)
+		}
+		seen[label] = struct{}{}
+	}
+	return nil
 }
 
 func ensureExtension(name string, filter Filter) string {
