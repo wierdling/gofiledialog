@@ -1,6 +1,7 @@
 package gofiledialog
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -49,8 +50,10 @@ type Browser struct {
 	history   []string
 	histIndex int
 
-	selectedRow   int
-	selectedRows  map[int]bool
+	selectedRow int
+	// selectedRows tracks explicit file selections by stable path rather than
+	// display index, so sorting and switching views do not change membership.
+	selectedRows  map[string]bool
 	selectingRow  bool
 	lastClickRow  int
 	lastClickTime time.Time
@@ -81,7 +84,7 @@ type Browser struct {
 func NewBrowser(startDir string) (*Browser, error) {
 	b := &Browser{
 		selectedRow:  -1,
-		selectedRows: make(map[int]bool),
+		selectedRows: make(map[string]bool),
 		lastClickRow: -1,
 		histIndex:    -1,
 		columns:      defaultColumns(),
@@ -154,11 +157,15 @@ func (b *Browser) SetFilter(filter func(FileEntry) bool) error {
 	return nil
 }
 
-// SetMultiSelect controls whether selected files accumulate. Directory
-// activation still navigates immediately.
+// SetMultiSelect controls whether regular files can be selected with the
+// explicit checkboxes shown by each collection view. Directory activation
+// still navigates immediately.
 func (b *Browser) SetMultiSelect(enabled bool) {
 	b.multi = enabled
 	b.clearSelection()
+	for _, v := range b.views {
+		v.Refresh()
+	}
 }
 
 // MultiSelect reports whether the browser permits more than one selected file.
@@ -338,7 +345,7 @@ func (b *Browser) applyListing(dir string, entries []FileEntry) {
 	b.dir = dir
 	b.entries = entries
 	b.selectedRow = -1
-	b.selectedRows = make(map[int]bool)
+	b.selectedRows = make(map[string]bool)
 	b.lastClickRow = -1
 	for _, v := range b.views {
 		v.UnselectAll()
@@ -367,15 +374,27 @@ func (b *Browser) Selected() (FileEntry, bool) {
 // SelectedEntries returns selected files in display order. Directories are
 // intentionally excluded for Open dialogs; Folder dialogs use CurrentDir.
 func (b *Browser) SelectedEntries() []FileEntry {
+	// In multi-select mode only explicitly selected files are returned. The
+	// active row is merely a keyboard highlight and must not implicitly select
+	// a file.
+	if b.multi {
+		entries := make([]FileEntry, 0, len(b.selectedRows))
+		for _, entry := range b.entries {
+			if b.selectedRows[entry.Path] && isRegularFileEntry(entry) {
+				entries = append(entries, entry)
+			}
+		}
+		return entries
+	}
 	if len(b.selectedRows) == 0 {
-		if entry, ok := b.Selected(); ok && !entry.IsDir {
+		if entry, ok := b.Selected(); ok && isRegularFileEntry(entry) {
 			return []FileEntry{entry}
 		}
 		return nil
 	}
 	entries := make([]FileEntry, 0, len(b.selectedRows))
-	for i, entry := range b.entries {
-		if b.selectedRows[i] && !entry.IsDir {
+	for _, entry := range b.entries {
+		if b.selectedRows[entry.Path] && isRegularFileEntry(entry) {
 			entries = append(entries, entry)
 		}
 	}
@@ -407,6 +426,22 @@ func (b *Browser) MoveSelection(delta int) {
 	b.selectRow(index)
 }
 
+// ToggleFocusedSelection toggles the explicit selection state of the focused
+// regular file. In multi-select mode keyboard focus is independent from the
+// checked set, so moving focus never changes selection and Space is the
+// deliberate toggle action. It reports whether a selection was toggled.
+func (b *Browser) ToggleFocusedSelection() bool {
+	if !b.multi {
+		return false
+	}
+	entry, ok := b.Selected()
+	if !ok || !isRegularFileEntry(entry) {
+		return false
+	}
+	b.setPathSelected(entry.Path, !b.selectedRows[entry.Path])
+	return true
+}
+
 // ActivateSelected opens the selected directory or activates the selected
 // file through OnActivate.
 func (b *Browser) ActivateSelected() {
@@ -420,7 +455,7 @@ func (b *Browser) ActivateSelected() {
 		}
 		return
 	}
-	if b.OnActivate != nil {
+	if b.OnActivate != nil && isRegularFileEntry(entry) {
 		b.OnActivate(entry)
 	}
 }
@@ -489,10 +524,26 @@ func (b *Browser) onEntryTapped(index int) {
 		}
 		return
 	}
+	if !isRegularFileEntry(entry) {
+		// A special filesystem entry may still receive a row click, but it is
+		// never a valid Open-dialog selection. Clear any previously selected
+		// regular file in single-select mode so callers do not retain stale
+		// paths, and notify them of the resulting empty selection just as a
+		// regular click does. Multi-select keeps its other valid selections.
+		if !b.multi {
+			b.clearSelection()
+		}
+		return
+	}
 	if b.multi {
-		b.selectedRows[index] = true
+		b.selectedRows[entry.Path] = true
 	} else {
-		b.selectedRows = map[int]bool{index: true}
+		b.selectedRows = map[string]bool{entry.Path: true}
+	}
+	// Collection widgets recycle their cells, so a click in one view must
+	// immediately propagate the checked state to every other view as well.
+	for _, view := range b.views {
+		view.Refresh()
 	}
 	b.selectionChanged()
 
@@ -512,13 +563,66 @@ func (b *Browser) onEntryTapped(index int) {
 	}
 }
 
+// isRegularFileEntry excludes filesystem special entries from Open-dialog
+// selection and activation. A zero mode is treated as regular for synthetic
+// FileEntry values used by callers and tests.
+func isRegularFileEntry(entry FileEntry) bool {
+	if entry.IsDir {
+		return false
+	}
+	if entry.Mode != 0 {
+		return entry.Mode.IsRegular()
+	}
+	// Synthetic entries may omit Mode; when a path exists, validate it so a
+	// manually supplied special file cannot bypass Open-dialog filtering.
+	if info, err := os.Stat(entry.Path); err == nil {
+		return info.Mode().IsRegular()
+	}
+	return true
+}
+
 func (b *Browser) selectRow(index int) {
 	if index < 0 || index >= len(b.entries) {
 		return
 	}
+	// Keyboard navigation and type-ahead must follow the same selection rules
+	// as pointer clicks: filesystem special entries can be highlighted, but
+	// they must never become a logical file selection. In single-select mode,
+	// clear any previously selected file so Save/Open cannot retain a stale
+	// path while the special row is active. Multi-select preserves its other
+	// explicit selections.
+	entry := b.entries[index]
+	if !b.multi && !entry.IsDir && !isRegularFileEntry(entry) {
+		// Keep the row highlight on special entries so keyboard navigation can
+		// continue past them, while clearing only the logical file selection.
+		b.selectedRow = index
+		b.selectedRows = make(map[string]bool)
+		b.selectingRow = true
+		switch b.viewMode {
+		case ViewDetails:
+			if b.table != nil {
+				b.table.Select(widget.TableCellID{Row: index, Col: 0})
+			}
+		case ViewList:
+			if b.list != nil {
+				b.list.Select(index)
+			}
+		default:
+			if grid, ok := b.grids[b.viewMode]; ok && grid != nil {
+				grid.Select(index)
+			}
+		}
+		b.selectingRow = false
+		b.selectionChanged()
+		return
+	}
 	b.selectedRow = index
-	if !b.multi && !b.entries[index].IsDir {
-		b.selectedRows = map[int]bool{index: true}
+	if !b.multi {
+		if entry.IsDir {
+			b.selectedRows = make(map[string]bool)
+		} else {
+			b.selectedRows = map[string]bool{entry.Path: true}
+		}
 	}
 	b.selectingRow = true
 	switch b.viewMode {
@@ -541,9 +645,36 @@ func (b *Browser) selectRow(index int) {
 
 func (b *Browser) clearSelection() {
 	b.selectedRow = -1
-	b.selectedRows = make(map[int]bool)
+	b.selectedRows = make(map[string]bool)
 	for _, v := range b.views {
 		v.UnselectAll()
+	}
+	b.selectionChanged()
+}
+
+// setPathSelected updates an explicit multi-selection by stable path. It is
+// used by recycled view checkboxes, which must never rely on a row index.
+func (b *Browser) setPathSelected(path string, selected bool) {
+	if !b.multi {
+		return
+	}
+	var regular bool
+	for _, entry := range b.entries {
+		if entry.Path == path {
+			regular = isRegularFileEntry(entry)
+			break
+		}
+	}
+	if !regular {
+		return
+	}
+	if selected {
+		b.selectedRows[path] = true
+	} else {
+		delete(b.selectedRows, path)
+	}
+	for _, view := range b.views {
+		view.Refresh()
 	}
 	b.selectionChanged()
 }

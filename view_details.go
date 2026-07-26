@@ -2,6 +2,7 @@ package gofiledialog
 
 import (
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/widget"
 )
 
@@ -9,21 +10,48 @@ import (
 // entries and column configuration. b.VisibleColumns() drives both the
 // column count/order and the sortable header buttons.
 func newDetailsTable(b *Browser) *widget.Table {
+	paths := make(map[*widget.Check]string)
+	suppress := make(map[*widget.Check]bool)
 	table := widget.NewTable(
 		func() (int, int) {
 			return len(b.entries), len(b.VisibleColumns())
 		},
 		func() fyne.CanvasObject {
-			return widget.NewLabel("")
+			check := widget.NewCheck("", nil)
+			check.Hide()
+			label := widget.NewLabel("")
+			paths[check] = ""
+			check.OnChanged = func(checked bool) {
+				if !suppress[check] {
+					b.setPathSelected(paths[check], checked)
+				}
+			}
+			return container.NewHBox(check, label)
 		},
 		func(id widget.TableCellID, obj fyne.CanvasObject) {
-			label := obj.(*widget.Label)
+			row := obj.(*fyne.Container)
+			check := row.Objects[0].(*widget.Check)
+			label := row.Objects[1].(*widget.Label)
 			cols := b.VisibleColumns()
 			if id.Row < 0 || id.Row >= len(b.entries) || id.Col >= len(cols) {
+				paths[check] = ""
+				check.Hide()
 				label.SetText("")
 				return
 			}
-			label.SetText(cols[id.Col].Text(b.entries[id.Row]))
+			entry := b.entries[id.Row]
+			col := cols[id.Col]
+			label.SetText(col.Text(entry))
+			if col.ID == ColName && b.multi && isRegularFileEntry(entry) {
+				paths[check] = entry.Path
+				suppress[check] = true
+				check.SetChecked(b.selectedRows[entry.Path])
+				suppress[check] = false
+				check.Show()
+			} else {
+				paths[check] = ""
+				check.Hide()
+			}
 		},
 	)
 	table.ShowHeaderRow = true

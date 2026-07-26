@@ -157,6 +157,80 @@ func TestOpenDialogRejectsMultipleTypedFilesWithoutMultiSelect(t *testing.T) {
 	}
 }
 
+func TestOpenDialogMultiActivationSubmitsCheckedSet(t *testing.T) {
+	fynetest.NewApp()
+	d, err := NewOpen(nil, WithStartDir(t.TempDir()), WithMultiSelect(true), WithStore(noopStore{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.browser.Close()
+	paths := []string{filepath.Join(d.browser.CurrentDir(), "one.txt"), filepath.Join(d.browser.CurrentDir(), "two.txt")}
+	for _, path := range paths {
+		if err := os.WriteFile(path, []byte("file"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d.browser.applyListing(d.browser.CurrentDir(), []FileEntry{
+		{Name: "one.txt", Path: paths[0], Mode: 0o644},
+		{Name: "two.txt", Path: paths[1], Mode: 0o644},
+	})
+	d.browser.onEntryTapped(0)
+	d.browser.onEntryTapped(1)
+	var got []dialogCallbackResult
+	d.SetOnChosen(func(paths []string, err error) { got = append(got, dialogCallbackResult{paths: paths, err: err}) })
+	d.browser.OnActivate(d.browser.entries[1])
+
+	assertOneCallback(t, got, paths, nil)
+}
+
+func TestOpenDialogMultiActivationIgnoresTypedFilename(t *testing.T) {
+	fynetest.NewApp()
+	d, err := NewOpen(nil, WithStartDir(t.TempDir()), WithMultiSelect(true), WithStore(noopStore{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.browser.Close()
+	checked := filepath.Join(d.browser.CurrentDir(), "checked.txt")
+	typed := filepath.Join(d.browser.CurrentDir(), "typed.txt")
+	for _, path := range []string{checked, typed} {
+		if err := os.WriteFile(path, []byte("file"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d.browser.applyListing(d.browser.CurrentDir(), []FileEntry{
+		{Name: "checked.txt", Path: checked, Mode: 0o644},
+		{Name: "typed.txt", Path: typed, Mode: 0o644},
+	})
+	d.browser.onEntryTapped(0)
+	d.fileEntry.SetText("typed.txt")
+	var got []dialogCallbackResult
+	d.SetOnChosen(func(paths []string, err error) { got = append(got, dialogCallbackResult{paths: paths, err: err}) })
+
+	d.activateSelected()
+	assertOneCallback(t, got, []string{checked}, nil)
+}
+
+func TestOpenDialogMultiActivationWithNoCheckedFilesStaysOpen(t *testing.T) {
+	fynetest.NewApp()
+	d, err := NewOpen(nil, WithStartDir(t.TempDir()), WithMultiSelect(true), WithStore(noopStore{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.browser.Close()
+	path := filepath.Join(d.browser.CurrentDir(), "one.txt")
+	if err := os.WriteFile(path, []byte("file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d.browser.applyListing(d.browser.CurrentDir(), []FileEntry{{Name: "one.txt", Path: path, Mode: 0o644}})
+	var got []dialogCallbackResult
+	d.SetOnChosen(func(paths []string, err error) { got = append(got, dialogCallbackResult{paths: paths, err: err}) })
+	d.browser.OnActivate(d.browser.entries[0])
+
+	if len(got) != 0 {
+		t.Fatalf("callback count = %d, want no callback for empty checked set", len(got))
+	}
+}
+
 func TestSaveDialogWindowCloseCancels(t *testing.T) {
 	fynetest.NewApp()
 	d := newTestSaveDialog(t)
