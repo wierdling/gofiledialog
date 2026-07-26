@@ -31,7 +31,7 @@ showing it.
 go get github.com/wierdling/gofiledialog
 ```
 
-The package targets Fyne v2 and Go 1.22 or newer.
+The package targets Fyne v2.7.4 and Go 1.22 or newer.
 
 ## Quick Start
 
@@ -96,6 +96,17 @@ if err != nil {
 	// dialog construction failed
 }
 ```
+
+### Cross-platform multi-select
+
+Fyne 2.7.4's `List`, `Table`, and `GridWrap` APIs do not expose portable
+Ctrl/Shift modifier state. When `WithMultiSelect(true)` is enabled,
+`gofiledialog` therefore uses an explicit checkbox fallback: check each file
+you want (the checkbox is shown beside the name in every view), uncheck files
+to remove them, and press **Open** to submit the checked files in display
+order. This works consistently across desktop and mobile backends and does
+not require modifier keys. Directory rows remain navigational; only checked
+regular files are returned.
 
 ## Save Dialog
 
@@ -163,7 +174,8 @@ d.Show()
 - `WithTitle(title string)` sets the dialog window title.
 - `WithStartDir(dir string)` sets the initial directory.
 - `WithFilters(filters ...Filter)` configures the Type dropdown.
-- `WithMultiSelect(enabled bool)` lets Open dialogs accumulate multiple clicked files.
+- `WithMultiSelect(enabled bool)` enables checkbox-based multi-select for Open
+  dialogs. Check or uncheck files, then press Open to return the checked set.
 - `WithFileName(name string)` pre-fills Save dialogs.
 - `WithStore(store Store)` overrides the default shared settings store.
 
@@ -250,7 +262,5 @@ go doc .
 
 This project is at the first release-pass stage for `v0.1.0`.
 
-Known limitation: `WithMultiSelect(true)` currently accumulates clicked files.
-Native Explorer-style Ctrl/Shift range selection will require custom row/item
-widgets because Fyne's stock `List`, `Table`, and `GridWrap` callbacks do not
-expose modifier-key selection state.
+Multi-select intentionally uses checkboxes instead of Ctrl/Shift gestures so
+the same interaction is available on every Fyne 2.7.4 backend.

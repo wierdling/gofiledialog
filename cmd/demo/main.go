@@ -17,10 +17,10 @@ func main() {
 	a := app.New()
 	win := a.NewWindow("gofiledialog demo")
 
-	result := widget.NewLabel("No file chosen yet.")
+	result := widget.NewLabel("No file chosen yet. In Open, check multiple files, then press Open.")
 	result.Wrapping = fyne.TextWrapWord
 
-	openBtn := widget.NewButton("Open file...", func() {
+	openBtn := widget.NewButton("Open files (check multiple)...", func() {
 		gofiledialog.ShowOpen(func(paths []string, err error) {
 			switch {
 			case err != nil:

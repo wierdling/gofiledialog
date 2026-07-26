@@ -15,6 +15,9 @@ type FileEntry struct {
 	Size        int64
 	ModTime     time.Time
 	CreatedTime time.Time
+	// Mode preserves the filesystem type so callers can distinguish regular
+	// files from special entries (sockets, devices, and named pipes).
+	Mode os.FileMode
 }
 
 func newFileEntry(dir string, info os.FileInfo) FileEntry {
@@ -26,5 +29,6 @@ func newFileEntry(dir string, info os.FileInfo) FileEntry {
 		Size:        info.Size(),
 		ModTime:     info.ModTime(),
 		CreatedTime: createdTime(info),
+		Mode:        info.Mode(),
 	}
 }

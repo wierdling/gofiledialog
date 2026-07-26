@@ -33,6 +33,44 @@ func (f fixedSizeLayout) MinSize([]fyne.CanvasObject) fyne.Size {
 	return f.size
 }
 
+// iconCellLayout keeps the icon and caption in a fixed grid cell while
+// overlaying the selection checkbox in the top-left corner. The checkbox is
+// deliberately not part of the vertical content flow, so showing it never
+// changes the icon/caption bounds or causes the cell to exceed its preset.
+type iconCellLayout struct {
+	size fyne.Size
+}
+
+func (l iconCellLayout) MinSize([]fyne.CanvasObject) fyne.Size { return l.size }
+
+func (l iconCellLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
+	if len(objects) < 3 {
+		return
+	}
+	cellSize := fyne.NewSize(minFloat(size.Width, l.size.Width), minFloat(size.Height, l.size.Height))
+	iconH := cellSize.Height - 28
+	if iconH < 0 {
+		iconH = 0
+	}
+	objects[0].Move(fyne.NewPos(0, 0))
+	objects[0].Resize(fyne.NewSize(24, 24))
+	objects[1].Move(fyne.NewPos(0, 0))
+	objects[1].Resize(fyne.NewSize(cellSize.Width, iconH))
+	labelW := cellSize.Width - 4
+	if labelW < 0 {
+		labelW = 0
+	}
+	objects[2].Move(fyne.NewPos(2, cellSize.Height-26))
+	objects[2].Resize(fyne.NewSize(labelW, 24))
+}
+
+func minFloat(a, b float32) float32 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func (f fixedSizeLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
 	for _, o := range objects {
 		o.Resize(size)
@@ -52,10 +90,20 @@ func newIconGrid(b *Browser, sz iconViewSize) *widget.GridWrap {
 	// which entry's thumbnail request is still relevant.
 	var mu sync.Mutex
 	current := map[*canvas.Image]string{}
+	checks := map[*widget.Check]string{}
+	suppress := map[*widget.Check]bool{}
 
 	grid := widget.NewGridWrap(
 		func() int { return len(b.entries) },
 		func() fyne.CanvasObject {
+			check := widget.NewCheck("", nil)
+			check.Hide()
+			checks[check] = ""
+			check.OnChanged = func(checked bool) {
+				if !suppress[check] {
+					b.setPathSelected(checks[check], checked)
+				}
+			}
 			img := canvas.NewImageFromResource(nil)
 			img.FillMode = canvas.ImageFillContain
 			img.SetMinSize(fyne.NewSize(sz.icon, sz.icon))
@@ -69,23 +117,35 @@ func newIconGrid(b *Browser, sz iconViewSize) *widget.GridWrap {
 			nameLabel.Wrapping = fyne.TextWrapWord
 
 			imgArea := container.NewStack(container.NewCenter(img), container.NewCenter(loading))
-			content := container.NewVBox(imgArea, nameLabel)
-			return container.New(fixedSizeLayout{size: fyne.NewSize(sz.cellW, sz.cellH)}, content)
+			content := container.New(iconCellLayout{size: fyne.NewSize(sz.cellW, sz.cellH)}, check, imgArea, nameLabel)
+			return content
 		},
 		func(id widget.GridWrapItemID, obj fyne.CanvasObject) {
-			cell := obj.(*fyne.Container)
-			content := cell.Objects[0].(*fyne.Container)
-			imgArea := content.Objects[0].(*fyne.Container)
+			content := obj.(*fyne.Container)
+			check := content.Objects[0].(*widget.Check)
+			imgArea := content.Objects[1].(*fyne.Container)
 			img := imgArea.Objects[0].(*fyne.Container).Objects[0].(*canvas.Image)
 			loading := imgArea.Objects[1].(*fyne.Container).Objects[0].(*widget.Label)
-			nameLabel := content.Objects[1].(*widget.Label)
+			nameLabel := content.Objects[2].(*widget.Label)
 
 			if id < 0 || id >= len(b.entries) {
+				checks[check] = ""
+				check.Hide()
 				nameLabel.SetText("")
 				loading.Hide()
 				return
 			}
 			entry := b.entries[id]
+			if b.multi && isRegularFileEntry(entry) {
+				checks[check] = entry.Path
+				suppress[check] = true
+				check.SetChecked(b.selectedRows[entry.Path])
+				suppress[check] = false
+				check.Show()
+			} else {
+				checks[check] = ""
+				check.Hide()
+			}
 			nameLabel.SetText(entry.Name)
 			img.Resource = entryIconResource(entry)
 			img.Refresh()

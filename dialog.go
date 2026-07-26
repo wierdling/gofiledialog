@@ -61,9 +61,9 @@ func WithFilters(filters ...Filter) Option {
 	return func(o *options) { o.filters = append([]Filter(nil), filters...) }
 }
 
-// WithMultiSelect allows Open dialogs to accumulate multiple selected files.
-// Fyne's built-in collection widgets do not expose modifier-key selection, so
-// selections accumulate as files are clicked.
+// WithMultiSelect enables checkbox-based multi-select for Open dialogs.
+// Checkboxes are used because Fyne's built-in collection widgets do not expose
+// portable Ctrl/Shift modifier-key state across all backends.
 func WithMultiSelect(enabled bool) Option {
 	return func(o *options) { o.multi = enabled }
 }
@@ -255,9 +255,16 @@ func NewOpen(parent fyne.Window, opts ...Option) (*OpenDialog, error) {
 	bottom := container.NewVBox(fields, buttons)
 
 	browser.OnActivate = func(entry FileEntry) {
+		// Activation submits the explicit checked set in multi-select mode,
+		// matching the Open button and keyboard Enter behavior. In single-select
+		// mode the active file remains the sole selection.
+		if browser.MultiSelect() {
+			d.activateSelected()
+			return
+		}
 		d.finish([]string{entry.Path}, nil)
 	}
-	installKeyboardShortcuts(win, browser, d.chooseSelected, d.cancel)
+	installKeyboardShortcuts(win, browser, d.activateSelected, d.cancel)
 
 	main := container.NewBorder(topBar, bottom, sidebar, nil, browser.Content())
 	win.SetContent(main)
@@ -460,6 +467,26 @@ func (d *OpenDialog) chooseSelected() {
 			return
 		}
 		d.finish(paths, nil)
+		return
+	}
+	selected := d.browser.SelectedEntries()
+	if len(selected) == 0 {
+		return
+	}
+	paths := make([]string, 0, len(selected))
+	for _, entry := range selected {
+		paths = append(paths, entry.Path)
+	}
+	d.finish(paths, nil)
+}
+
+// activateSelected handles Enter and row activation. In multi-select mode,
+// activation submits only the explicitly checked files; text in the filename
+// field must not override that checked set. The Open button and filename entry
+// submission continue to use chooseSelected, which supports typed filenames.
+func (d *OpenDialog) activateSelected() {
+	if !d.browser.MultiSelect() {
+		d.chooseSelected()
 		return
 	}
 	selected := d.browser.SelectedEntries()
@@ -766,6 +793,9 @@ func installKeyboardShortcuts(win fyne.Window, b *Browser, onEnter, onCancel fun
 			if onEnter != nil {
 				onEnter()
 			}
+			return
+		case fyne.KeySpace:
+			b.ToggleFocusedSelection()
 			return
 		case fyne.KeyBackspace:
 			if err := b.Up(); err != nil && b.OnError != nil {
