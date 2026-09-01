@@ -93,7 +93,8 @@ func newIconGrid(b *Browser, sz iconViewSize) *widget.GridWrap {
 	checks := map[*widget.Check]string{}
 	suppress := map[*widget.Check]bool{}
 
-	grid := widget.NewGridWrap(
+	var grid *widget.GridWrap
+	grid = widget.NewGridWrap(
 		func() int { return len(b.entries) },
 		func() fyne.CanvasObject {
 			check := widget.NewCheck("", nil)
@@ -118,10 +119,15 @@ func newIconGrid(b *Browser, sz iconViewSize) *widget.GridWrap {
 
 			imgArea := container.NewStack(container.NewCenter(img), container.NewCenter(loading))
 			content := container.New(iconCellLayout{size: fyne.NewSize(sz.cellW, sz.cellH)}, check, imgArea, nameLabel)
-			return content
+			return newTappableContainer(content, nil)
 		},
 		func(id widget.GridWrapItemID, obj fyne.CanvasObject) {
-			content := obj.(*fyne.Container)
+			cell := obj.(*tappableContainer)
+			content := cell.content.(*fyne.Container)
+			cell.setOnTapped(func() {
+				grid.Select(id)
+				b.onEntryTapped(id)
+			})
 			check := content.Objects[0].(*widget.Check)
 			imgArea := content.Objects[1].(*fyne.Container)
 			img := imgArea.Objects[0].(*fyne.Container).Objects[0].(*canvas.Image)
@@ -175,6 +181,5 @@ func newIconGrid(b *Browser, sz iconViewSize) *widget.GridWrap {
 			})
 		},
 	)
-	grid.OnSelected = func(id widget.GridWrapItemID) { b.onEntryTapped(id) }
 	return grid
 }

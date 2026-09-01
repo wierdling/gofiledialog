@@ -33,7 +33,7 @@ func TestDetailsCheckboxWidgetBindingAndRecycle(t *testing.T) {
 	cell := table.CreateCell()
 	// Name is the first visible column and owns the checkbox.
 	table.UpdateCell(widget.TableCellID{Row: 0, Col: 0}, cell)
-	check := cell.(*fyne.Container).Objects[0].(*widget.Check)
+	check := cell.(*tappableContainer).content.(*fyne.Container).Objects[0].(*widget.Check)
 	if !check.Visible() || check.Checked {
 		t.Fatalf("regular file checkbox visibility=%v checked=%v", check.Visible(), check.Checked)
 	}
@@ -58,7 +58,7 @@ func TestListCheckboxWidgetBindingAndRecycle(t *testing.T) {
 	list := newEntryList(b)
 	row := list.CreateItem()
 	list.UpdateItem(0, row)
-	check := row.(*fyne.Container).Objects[0].(*widget.Check)
+	check := row.(*tappableContainer).content.(*fyne.Container).Objects[0].(*widget.Check)
 	if !check.Visible() {
 		t.Fatal("regular file checkbox should be visible")
 	}
@@ -79,7 +79,7 @@ func TestIconCheckboxLayoutAndCrossViewState(t *testing.T) {
 		grid := newIconGrid(b, preset)
 		cell := grid.CreateItem()
 		grid.UpdateItem(0, cell)
-		obj := cell.(*fyne.Container)
+		obj := cell.(*tappableContainer).content.(*fyne.Container)
 		obj.Resize(fyne.NewSize(preset.cellW, preset.cellH))
 		check := obj.Objects[0].(*widget.Check)
 		if !check.Visible() || !check.Checked {
@@ -121,13 +121,80 @@ func TestMultiRowClickRefreshesCheckboxStateAcrossViews(t *testing.T) {
 	table.UpdateCell(widget.TableCellID{Row: 0, Col: 0}, detailsCell)
 	list.UpdateItem(0, listCell)
 	grid.UpdateItem(0, gridCell)
-	if check := detailsCell.(*fyne.Container).Objects[0].(*widget.Check); !check.Checked {
+	if check := detailsCell.(*tappableContainer).content.(*fyne.Container).Objects[0].(*widget.Check); !check.Checked {
 		t.Fatal("details checkbox did not reflect row click")
 	}
-	if check := listCell.(*fyne.Container).Objects[0].(*widget.Check); !check.Checked {
+	if check := listCell.(*tappableContainer).content.(*fyne.Container).Objects[0].(*widget.Check); !check.Checked {
 		t.Fatal("list checkbox did not reflect row click")
 	}
-	if check := gridCell.(*fyne.Container).Objects[0].(*widget.Check); !check.Checked {
+	if check := gridCell.(*tappableContainer).content.(*fyne.Container).Objects[0].(*widget.Check); !check.Checked {
 		t.Fatal("icon checkbox did not reflect row click")
+	}
+}
+
+func TestEntryCellsRouteEveryTapAndActivateOnSecondTap(t *testing.T) {
+	views := []struct {
+		name string
+		bind func(*Browser) (fyne.CanvasObject, func(fyne.CanvasObject))
+	}{
+		{name: "details", bind: func(b *Browser) (fyne.CanvasObject, func(fyne.CanvasObject)) {
+			table := newDetailsTable(b)
+			return table, func(obj fyne.CanvasObject) { table.UpdateCell(widget.TableCellID{Row: 0, Col: 0}, obj) }
+		}},
+		{name: "list", bind: func(b *Browser) (fyne.CanvasObject, func(fyne.CanvasObject)) {
+			list := newEntryList(b)
+			return list, func(obj fyne.CanvasObject) { list.UpdateItem(0, obj) }
+		}},
+		{name: "icons", bind: func(b *Browser) (fyne.CanvasObject, func(fyne.CanvasObject)) {
+			grid := newIconGrid(b, smallIconSize)
+			return grid, func(obj fyne.CanvasObject) { grid.UpdateItem(0, obj) }
+		}},
+	}
+
+	for _, view := range views {
+		t.Run(view.name, func(t *testing.T) {
+			b := widgetTestBrowser(t)
+			activated := 0
+			b.OnActivate = func(FileEntry) { activated++ }
+			obj, update := view.bind(b)
+
+			var item fyne.CanvasObject
+			switch collection := obj.(type) {
+			case *widget.Table:
+				item = collection.CreateCell()
+			case *widget.List:
+				item = collection.CreateItem()
+			case *widget.GridWrap:
+				item = collection.CreateItem()
+			}
+			update(item)
+			tappable := item.(*tappableContainer)
+			tappable.Tapped(nil)
+			if b.selectedRow != 0 || !b.selectedRows[b.entries[0].Path] || activated != 0 {
+				t.Fatalf("first tap selectedRow=%d selected=%v activations=%d", b.selectedRow, b.selectedRows, activated)
+			}
+			tappable.Tapped(nil)
+			if activated != 1 {
+				t.Fatalf("second tap activations=%d, want 1", activated)
+			}
+		})
+	}
+}
+
+func TestDetailsCellTapPreservesClickedColumnFocus(t *testing.T) {
+	b := widgetTestBrowser(t)
+	table := newDetailsTable(b)
+	cell := table.CreateCell()
+	table.UpdateCell(widget.TableCellID{Row: 0, Col: 1}, cell)
+	var selected widget.TableCellID
+	table.OnSelected = func(id widget.TableCellID) { selected = id }
+	tappable := cell.(*tappableContainer)
+	tappable.Tapped(nil)
+
+	// A second tap in the same cell must still be treated as the same row for
+	// activation, while the collection retains the exact clicked cell focus.
+	tappable.Tapped(nil)
+	if selected != (widget.TableCellID{Row: 0, Col: 1}) {
+		t.Fatalf("selected cell=%v, want row 0 column 1", selected)
 	}
 }

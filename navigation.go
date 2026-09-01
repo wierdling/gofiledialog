@@ -35,6 +35,13 @@ func (t *tappableContainer) Tapped(*fyne.PointEvent) {
 	}
 }
 
+// setOnTapped updates the callback of a recycled tappable container. Entry
+// views reuse their cells, so the callback must be rebound with the current
+// item ID whenever a cell is updated.
+func (t *tappableContainer) setOnTapped(onTapped func()) {
+	t.onTapped = onTapped
+}
+
 // pathSegments splits an absolute path into clickable breadcrumb segments,
 // each carrying the cumulative path up to and including that segment.
 func pathSegments(path string) []Place {

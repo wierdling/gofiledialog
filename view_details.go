@@ -12,7 +12,8 @@ import (
 func newDetailsTable(b *Browser) *widget.Table {
 	paths := make(map[*widget.Check]string)
 	suppress := make(map[*widget.Check]bool)
-	table := widget.NewTable(
+	var table *widget.Table
+	table = widget.NewTable(
 		func() (int, int) {
 			return len(b.entries), len(b.VisibleColumns())
 		},
@@ -26,10 +27,15 @@ func newDetailsTable(b *Browser) *widget.Table {
 					b.setPathSelected(paths[check], checked)
 				}
 			}
-			return container.NewHBox(check, label)
+			return newTappableContainer(container.NewHBox(check, label), nil)
 		},
 		func(id widget.TableCellID, obj fyne.CanvasObject) {
-			row := obj.(*fyne.Container)
+			cell := obj.(*tappableContainer)
+			row := cell.content.(*fyne.Container)
+			cell.setOnTapped(func() {
+				table.Select(id)
+				b.onEntryTapped(id.Row)
+			})
 			check := row.Objects[0].(*widget.Check)
 			label := row.Objects[1].(*widget.Label)
 			cols := b.VisibleColumns()
@@ -72,7 +78,6 @@ func newDetailsTable(b *Browser) *widget.Table {
 			b.SetSort(col.ID)
 		}
 	}
-	table.OnSelected = func(id widget.TableCellID) { b.onEntryTapped(id.Row) }
 	b.applyColumnWidths(table)
 	return table
 }
