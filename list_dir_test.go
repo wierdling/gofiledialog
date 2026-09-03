@@ -3,6 +3,7 @@ package gofiledialog
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -40,6 +41,9 @@ func TestListDirReturnsReadError(t *testing.T) {
 }
 
 func TestListDirUsesSymlinkNameForHiddenStatus(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows hidden status is an attribute, not a dot-prefixed name")
+	}
 	base := t.TempDir()
 	visibleTarget := filepath.Join(base, "visible")
 	hiddenTarget := filepath.Join(base, ".hidden-target")
