@@ -11,7 +11,8 @@ import (
 func newEntryList(b *Browser) *widget.List {
 	paths := make(map[*widget.Check]string)
 	suppress := make(map[*widget.Check]bool)
-	list := widget.NewList(
+	var list *widget.List
+	list = widget.NewList(
 		func() int { return len(b.entries) },
 		func() fyne.CanvasObject {
 			check := widget.NewCheck("", nil)
@@ -24,10 +25,15 @@ func newEntryList(b *Browser) *widget.List {
 					b.setPathSelected(paths[check], checked)
 				}
 			}
-			return container.NewHBox(check, icon, label)
+			return newTappableContainer(container.NewHBox(check, icon, label), nil)
 		},
 		func(id widget.ListItemID, obj fyne.CanvasObject) {
-			row := obj.(*fyne.Container)
+			cell := obj.(*tappableContainer)
+			row := cell.content.(*fyne.Container)
+			cell.setOnTapped(func() {
+				list.Select(id)
+				b.onEntryTapped(id)
+			})
 			check := row.Objects[0].(*widget.Check)
 			icon := row.Objects[1].(*widget.Icon)
 			label := row.Objects[2].(*widget.Label)
@@ -52,6 +58,5 @@ func newEntryList(b *Browser) *widget.List {
 			label.SetText(entry.Name)
 		},
 	)
-	list.OnSelected = func(id widget.ListItemID) { b.onEntryTapped(id) }
 	return list
 }
